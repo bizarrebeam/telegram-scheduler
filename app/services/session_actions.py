@@ -1,13 +1,13 @@
 import logging
 from datetime import UTC, datetime
 
+from app.errors import classify_error, is_uncertain_calendar_error
 from app.google.calendar import GoogleAuthRequired, delete_event, update_event_time
 from app.google.oauth import load_user_credentials
+from app.observability import log_event
 from app.services import history, jobs, proposals, reminders
 from app.services import sessions as sessions_service
 from app.services import settings as settings_service
-
-logger = logging.getLogger(__name__)
 
 MAX_EXTENSION_MINUTES = 240
 
@@ -49,13 +49,20 @@ def extend_active_session(telegram_user_id: int, minutes: int) -> dict:
             except GoogleAuthRequired:
                 return {"status": "needs_auth", "session": updated}
             except Exception as exc:  # noqa: BLE001
+                error_code, _ = classify_error(exc)
+                uncertain = is_uncertain_calendar_error(exc)
                 history.record(
                     "calendar_extend_failed",
                     task_id=str(session["task_id"]),
                     session_id=str(session["id"]),
-                    details={"error": str(exc)[:300]},
+                    details={"error_code": error_code},
                 )
-                return {"status": "calendar_failed", "session": updated}
+                return {
+                    "status": "calendar_failed",
+                    "session": updated,
+                    "error_code": error_code,
+                    "uncertain": uncertain,
+                }
             if not ok:
                 note = " The calendar event wasn't found. It may have been deleted manually."
     history.record(
@@ -136,8 +143,21 @@ def reschedule_session(session_id: str, telegram_user_id: int) -> dict:
             except GoogleAuthRequired:
                 return {"status": "needs_auth", "session": session}
             except Exception as exc:  # noqa: BLE001
-                logger.warning("calendar delete failed during reschedule: %s", exc)
-                return {"status": "calendar_failed", "session": session}
+                error_code, _ = classify_error(exc)
+                log_event(
+                    logging.WARNING,
+                    "calendar_delete_failed",
+                    operation="reschedule",
+                    outcome="error",
+                    error_type=type(exc).__name__,
+                    error_code=error_code,
+                )
+                return {
+                    "status": "calendar_failed",
+                    "session": session,
+                    "error_code": error_code,
+                    "uncertain": is_uncertain_calendar_error(exc),
+                }
     sessions_service.set_status(session_id, "cancelled")
     jobs.cancel_session_jobs(session_id)
     history.record(
@@ -145,6 +165,24 @@ def reschedule_session(session_id: str, telegram_user_id: int) -> dict:
         task_id=str(session["task_id"]),
         session_id=session_id,
     )
-    result = proposals.propose_for_task(str(session["task_id"]), telegram_user_id)
+    try:
+        result = proposals.propose_for_task(
+            str(session["task_id"]), telegram_user_id
+        )
+    except Exception as exc:  # noqa: BLE001
+        error_code, _ = classify_error(exc)
+        log_event(
+            logging.WARNING,
+            "reschedule_proposal_failed",
+            operation="reschedule",
+            outcome="error",
+            error_type=type(exc).__name__,
+            error_code=error_code,
+        )
+        return {
+            "status": "proposal_failed",
+            "error_code": error_code,
+            "previous_session_id": session_id,
+        }
     result["previous_session_id"] = session_id
     return result

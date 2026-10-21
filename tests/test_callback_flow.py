@@ -3,9 +3,16 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
+
 from app.config import get_settings
 from app.telegram_bot import bot
-from app.telegram_bot.bot import callback_handler, plan_command, today_command
+from app.telegram_bot.bot import (
+    callback_handler,
+    error_handler,
+    plan_command,
+    today_command,
+)
 
 
 def make_callback_update(data: str, user_id: int = 111):
@@ -323,3 +330,107 @@ def test_queue_page_two_shows_navigation(monkeypatch) -> None:
     datas = [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data]
     assert "page:0" in datas
     assert "schedule:task0005" in datas
+
+def test_callback_timeout_reports_uncertain_failure(monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "111")
+    monkeypatch.setattr("app.telegram_bot.bot._timezone", lambda uid: "Asia/Jakarta")
+
+    def boom(proposal_id, user_id):
+        raise httpx.ReadTimeout("calendar timed out")
+
+    monkeypatch.setattr("app.telegram_bot.bot.approve_proposal", boom)
+    update = make_callback_update("approve:prop-1")
+    run(callback_handler, update, make_context())
+    text = update.callback_query.edit_message_text.call_args.args[0]
+    assert "didn't respond in time" in text
+    assert "couldn't confirm" in text
+    assert "Added to Google Calendar" not in text
+    assert "calendar timed out" not in text
+
+
+def test_callback_http_error_is_mapped_without_raw_exception(monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "111")
+    monkeypatch.setattr("app.telegram_bot.bot._timezone", lambda uid: "Asia/Jakarta")
+    request = httpx.Request("POST", "https://example.test/calendar")
+    response = httpx.Response(500, request=request)
+
+    def boom(proposal_id, user_id):
+        raise httpx.HTTPStatusError(
+            "server error", request=request, response=response
+        )
+
+    monkeypatch.setattr("app.telegram_bot.bot.approve_proposal", boom)
+    update = make_callback_update("approve:prop-1")
+    run(callback_handler, update, make_context())
+    text = update.callback_query.edit_message_text.call_args.args[0]
+    assert "Google Calendar returned an error" in text
+    assert "couldn't confirm" in text
+    assert "server error" not in text
+
+
+def test_callback_uncertain_event_does_not_claim_success(monkeypatch) -> None:
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "111")
+    monkeypatch.setattr("app.telegram_bot.bot._timezone", lambda uid: "Asia/Jakarta")
+    monkeypatch.setattr(
+        "app.telegram_bot.bot.approve_proposal",
+        lambda proposal_id, user_id: {
+            "status": "event_uncertain",
+            "error_code": "timeout",
+        },
+    )
+    update = make_callback_update("approve:prop-1")
+    run(callback_handler, update, make_context())
+    text = update.callback_query.edit_message_text.call_args.args[0]
+    assert "couldn't confirm whether the event was created" in text
+    assert "Retrying is safe" in text
+    assert "Added to Google Calendar" not in text
+
+
+def test_reschedule_failure_does_not_claim_previous_session_cancelled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "111")
+    monkeypatch.setattr("app.telegram_bot.bot._timezone", lambda uid: "Asia/Jakarta")
+    monkeypatch.setattr(
+        "app.telegram_bot.bot.session_actions.reschedule_session",
+        lambda session_id, user_id: {
+            "status": "calendar_failed",
+            "uncertain": True,
+        },
+    )
+    update = make_callback_update("reschedule:sess-1")
+    run(callback_handler, update, make_context())
+    text = update.callback_query.edit_message_text.call_args.args[0]
+    assert "existing session is still scheduled" in text
+    assert "previous session has been cancelled" not in text.lower()
+
+
+def test_global_error_handler_sends_failure_message() -> None:
+    update = make_message_update()
+    update.effective_message = update.message
+    context = SimpleNamespace(error=httpx.ReadTimeout("calendar timed out"))
+    asyncio.run(error_handler(update, context))
+    text = update.message.reply_text.call_args.args[0]
+    assert "didn't respond in time" in text
+    assert "calendar timed out" not in text
+
+
+def test_callback_ack_is_logged_with_timing(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "111")
+    monkeypatch.setattr("app.telegram_bot.bot._timezone", lambda uid: "Asia/Jakarta")
+    monkeypatch.setattr(
+        "app.telegram_bot.bot.approve_proposal",
+        lambda proposal_id, user_id: {
+            "status": "approved",
+            "start": datetime.now(UTC),
+            "end": datetime.now(UTC) + timedelta(minutes=60),
+            "task_title": "Apply MT",
+        },
+    )
+    update = make_callback_update("approve:prop-1")
+    with caplog.at_level("INFO", logger="app"):
+        run(callback_handler, update, make_context())
+    ack = [r for r in caplog.records if getattr(r, "event", "") == "callback_ack"]
+    assert ack
+    assert ack[0].action == "approve"
+    assert ack[0].duration_ms >= 0

@@ -106,6 +106,9 @@ def test_reschedule_cancels_and_reproposes(monkeypatch) -> None:
     )
     monkeypatch.setattr(session_actions, "delete_event", lambda *a, **k: True)
     monkeypatch.setattr(
+        session_actions.jobs, "cancel_session_jobs", lambda sid: 0
+    )
+    monkeypatch.setattr(
         session_actions.proposals,
         "propose_for_task",
         lambda task_id, uid: {"status": "proposed"},

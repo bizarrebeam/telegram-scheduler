@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from app.db import get_conn_dict
+from app.errors import classify_error, is_uncertain_calendar_error
 from app.google.calendar import (
     EventConflict,
     GoogleAuthRequired,
@@ -245,6 +246,7 @@ def approve_proposal(proposal_id: str, telegram_user_id: int) -> dict:
 
         start = proposal["proposed_start_at"]
         end = proposal["proposed_end_at"]
+        event_id = str(session["id"]).replace("-", "")
         try:
             busy = get_busy_intervals(creds, start, end, calendar_id)
         except GoogleAuthRequired:
@@ -253,59 +255,75 @@ def approve_proposal(proposal_id: str, telegram_user_id: int) -> dict:
         other_tasks = _own_planned_intervals(
             start, end, exclude_session_id=str(session["id"])
         )
+        created_id: str | None = None
         if (
             any(start < b_end and end > b_start for b_start, b_end in booked)
             or _breaks_gap(start, end, other_tasks, 30)
         ):
-            conn.execute(
-                "UPDATE schedule_proposals SET status = 'superseded' WHERE id = %s",
-                (proposal_id,),
-            )
-            conn.execute(
-                "UPDATE task_sessions SET status = 'superseded' WHERE id = %s",
-                (session["id"],),
-            )
-            history.record(
-                "proposal_superseded_conflict",
-                task_id=str(task["id"]),
-                session_id=str(session["id"]),
-                details={"proposal_id": proposal_id},
-            )
-            return {"status": "slot_taken", "task_id": str(task["id"])}
+            existing = get_event(creds, calendar_id, event_id)
+            if existing is None:
+                conn.execute(
+                    "UPDATE schedule_proposals SET status = 'superseded' WHERE id = %s",
+                    (proposal_id,),
+                )
+                conn.execute(
+                    "UPDATE task_sessions SET status = 'superseded' WHERE id = %s",
+                    (session["id"],),
+                )
+                history.record(
+                    "proposal_superseded_conflict",
+                    task_id=str(task["id"]),
+                    session_id=str(session["id"]),
+                    details={"proposal_id": proposal_id},
+                )
+                return {"status": "slot_taken", "task_id": str(task["id"])}
+            created_id = event_id
 
-        event_id = str(session["id"]).replace("-", "")
         summary = f"[Task] {task['title']}"
         description = (
             f"Task ID: {str(task['id'])[:8]}\n"
             f"Estimated duration: {session['planned_duration_minutes']} minutes\n"
             f"First step: {(task.get('first_step') or '').strip() or '-'}"
         )
-        try:
-            created_id = _create_event_idempotent(
-                creds,
-                calendar_id,
-                event_id=event_id,
-                summary=summary,
-                description=description,
-                start=start,
-                end=end,
-            )
-        except Exception as exc:  # noqa: BLE001
-            conn.execute(
-                """
-                UPDATE schedule_proposals
-                SET status = 'failed'
-                WHERE id = %s AND status = 'pending'
-                """,
-                (proposal_id,),
-            )
-            history.record(
-                "calendar_event_failed",
-                task_id=str(task["id"]),
-                session_id=str(session["id"]),
-                details={"error": str(exc)[:300]},
-            )
-            return {"status": "event_failed", "error": str(exc)}
+        if created_id is None:
+            try:
+                created_id = _create_event_idempotent(
+                    creds,
+                    calendar_id,
+                    event_id=event_id,
+                    summary=summary,
+                    description=description,
+                    start=start,
+                    end=end,
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_code, _ = classify_error(exc)
+                if is_uncertain_calendar_error(exc):
+                    history.record(
+                        "calendar_event_uncertain",
+                        task_id=str(task["id"]),
+                        session_id=str(session["id"]),
+                        details={"error_code": error_code},
+                    )
+                    return {
+                        "status": "event_uncertain",
+                        "error_code": error_code,
+                    }
+                conn.execute(
+                    """
+                    UPDATE schedule_proposals
+                    SET status = 'failed'
+                    WHERE id = %s AND status = 'pending'
+                    """,
+                    (proposal_id,),
+                )
+                history.record(
+                    "calendar_event_failed",
+                    task_id=str(task["id"]),
+                    session_id=str(session["id"]),
+                    details={"error_code": error_code},
+                )
+                return {"status": "event_failed", "error_code": error_code}
 
         conn.execute(
             """

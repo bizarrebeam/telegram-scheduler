@@ -1,8 +1,8 @@
-﻿import logging
-from datetime import UTC, date, datetime
+﻿from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from app.db import get_conn_dict
+from app.errors import classify_error, is_uncertain_calendar_error
 from app.google.calendar import (
     EventConflict,
     GoogleAuthRequired,
@@ -14,9 +14,6 @@ from app.google.oauth import load_user_credentials
 from app.parsing.basic import deadline_end
 from app.services import history
 from app.services import settings as settings_service
-
-logger = logging.getLogger(__name__)
-
 
 def _calendar_id(user_settings: dict) -> str:
     from app.config import get_settings
@@ -195,12 +192,21 @@ def approve_deadline(reminder_id: str, telegram_user_id: int) -> dict:
             return {"status": "needs_auth"}
         event_date = reminder["pending_date"] or reminder["event_date"]
         if reminder["status"] == "pending_update" and reminder["google_event_id"]:
-            ok = update_event_date(
-                creds,
-                calendar_id,
-                reminder["google_event_id"],
-                event_date=event_date,
-            )
+            try:
+                ok = update_event_date(
+                    creds,
+                    calendar_id,
+                    reminder["google_event_id"],
+                    event_date=event_date,
+                )
+            except Exception as exc:  # noqa: BLE001
+                error_code, _ = classify_error(exc)
+                if is_uncertain_calendar_error(exc):
+                    return {
+                        "status": "event_uncertain",
+                        "error_code": error_code,
+                    }
+                return {"status": "event_failed", "error_code": error_code}
             if not ok:
                 return {"status": "event_missing"}
             event_id = reminder["google_event_id"]
@@ -218,8 +224,13 @@ def approve_deadline(reminder_id: str, telegram_user_id: int) -> dict:
                     event_date=event_date,
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("deadline event failed: %s", exc)
-                return {"status": "event_failed", "error": str(exc)}
+                error_code, _ = classify_error(exc)
+                if is_uncertain_calendar_error(exc):
+                    return {
+                        "status": "event_uncertain",
+                        "error_code": error_code,
+                    }
+                return {"status": "event_failed", "error_code": error_code}
         conn.execute(
             """
             UPDATE deadline_reminders

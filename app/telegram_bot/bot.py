@@ -1,7 +1,9 @@
 ﻿import asyncio
 import logging
 import re
+import time
 from datetime import UTC, date, datetime
+from functools import wraps
 
 from telegram import (
     InlineKeyboardButton,
@@ -19,7 +21,14 @@ from telegram.ext import (
 )
 
 from app.config import get_settings
+from app.errors import classify_error, error_fields
 from app.google.oauth import create_authorization_state, has_credentials
+from app.observability import (
+    configure_logging,
+    log_context,
+    log_event,
+    timed_event,
+)
 from app.parsing.ai import parse_message
 from app.parsing.basic import (
     is_overwhelm,
@@ -69,8 +78,6 @@ from app.telegram_bot.ui import (
     task_keyboard,
     today_keyboard,
 )
-
-logger = logging.getLogger(__name__)
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 PROGRESS_INTERVAL_SECONDS = 12
@@ -156,12 +163,114 @@ HELP_TEXT = (
 )
 
 
+def _instrument_handler(name: str):
+    def decorator(handler):
+        @wraps(handler)
+        async def wrapped(update, context):
+            update_id = getattr(update, "update_id", None)
+            request_id = f"tg-{update_id}" if update_id is not None else None
+            with log_context(
+                "telegram_update",
+                request_id=request_id,
+                update_id=update_id,
+            ):
+                with timed_event("telegram_update", handler=name):
+                    return await handler(update, context)
+
+        return wrapped
+
+    return decorator
+
+
+def _failure_text(exc: BaseException, *, operation: str) -> str:
+    code, _ = classify_error(exc)
+    if code == "auth_required":
+        return "Google Calendar needs to be reconnected. Use /auth."
+    if code == "database_error":
+        return (
+            "I couldn't reach the database, so I couldn't confirm the result. "
+            "Please try again shortly."
+        )
+    if code == "timeout":
+        if operation in ("approve", "deadline_ok", "reschedule"):
+            return (
+                "Google Calendar didn't respond in time. I couldn't confirm "
+                "whether the change was applied. Check your calendar before "
+                "retrying."
+            )
+        return (
+            "Google Calendar didn't respond in time, so I couldn't check your "
+            "calendar. Nothing was created or changed. Your task is still saved. "
+            "Please try again shortly."
+        )
+    if code == "network":
+        return (
+            "I couldn't reach Google Calendar. Nothing was confirmed. Your task "
+            "is still saved. Please try again shortly."
+        )
+    if code == "rate_limited":
+        return (
+            "Google Calendar is rate-limiting requests right now. Nothing was "
+            "confirmed. Please try again in a minute."
+        )
+    if code.startswith("http_5"):
+        return (
+            "Google Calendar returned an error. I couldn't confirm whether the "
+            "change was applied. Check your calendar before retrying."
+        )
+    if code.startswith("http_"):
+        return (
+            "Google Calendar rejected the request. Nothing was confirmed. "
+            "Please try again shortly."
+        )
+    if code == "event_conflict":
+        return (
+            "Google Calendar reported a conflicting event. I couldn't confirm "
+            "the result. Check your calendar before retrying."
+        )
+    if operation in ("plan", "schedule", "prep", "another", "capture"):
+        return (
+            "I couldn't check your calendar just now. Nothing was created or "
+            "changed. Your task is still saved. Please try again shortly."
+        )
+    return (
+        "Something went wrong and I couldn't confirm the result. Please try "
+        "again. Your task is still saved."
+    )
+
+
+def _uncertain_event_text(*, operation: str) -> str:
+    if operation == "deadline":
+        return (
+            "Google Calendar didn't respond in time. I couldn't confirm whether "
+            "the all-day reminder was created or updated. Check your calendar "
+            "before retrying. Retrying is safe because I reuse the same event ID."
+        )
+    if operation == "reschedule":
+        return (
+            "Google Calendar didn't respond in time. I couldn't confirm whether "
+            "the previous event was removed. Your existing session is still "
+            "scheduled. Please try again shortly."
+        )
+    if operation == "extend":
+        return (
+            "Google Calendar didn't respond in time. Your local session time was "
+            "extended, but I couldn't confirm the calendar update. Check your "
+            "calendar before relying on the new end time."
+        )
+    return (
+        "Google Calendar didn't respond in time. I couldn't confirm whether the "
+        "event was created. Check your calendar before retrying. Retrying is "
+        "safe because I reuse the same event ID."
+    )
+
+
 async def _authorized(update: Update) -> bool:
     settings = get_settings()
     user = update.effective_user
     user_id = user.id if user else None
     if not is_authorized(user_id, settings):
-        logger.warning("rejected unauthorized telegram user_id=%s", user_id)
+        log_event(logging.WARNING, "telegram_unauthorized", outcome="rejected")
         return False
     return True
 
@@ -178,12 +287,22 @@ async def _reply(message, text: str, reply_markup=None):
             if attempt == 0:
                 await asyncio.sleep(min(exc.retry_after, 10) + 1)
                 continue
-            logger.warning("reply dropped after RetryAfter")
-        except TimedOut:
+            log_event(
+                logging.WARNING,
+                "telegram_reply_dropped",
+                error_type=type(exc).__name__,
+                outcome="error",
+            )
+        except TimedOut as exc:
             if attempt == 0:
                 await asyncio.sleep(2)
                 continue
-            logger.warning("reply dropped after timeout")
+            log_event(
+                logging.WARNING,
+                "telegram_reply_dropped",
+                error_type=type(exc).__name__,
+                outcome="error",
+            )
     return None
 
 
@@ -197,7 +316,12 @@ async def _update_status(message, status, text: str, reply_markup=None) -> None:
             )
             return
         except Exception as exc:  # noqa: BLE001
-            logger.info("status edit failed, sending a new message: %s", exc)
+            log_event(
+                logging.WARNING,
+                "telegram_status_edit_failed",
+                error_type=type(exc).__name__,
+                outcome="error",
+            )
     await _reply(message, text, reply_markup=reply_markup)
 
 
@@ -209,7 +333,12 @@ async def _edit_message(message, text: str, reply_markup=None) -> None:
             link_preview_options=NO_PREVIEW,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.info("message edit failed, sending a new message: %s", exc)
+        log_event(
+            logging.WARNING,
+            "telegram_message_edit_failed",
+            error_type=type(exc).__name__,
+            outcome="error",
+        )
         await _reply(message, text, reply_markup=reply_markup)
 
 
@@ -552,12 +681,18 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "I'm checking your calendar for an available slot.",
             lambda: asyncio.to_thread(propose_for_task, task_id, user_id),
         )
-    except Exception:  # noqa: BLE001
-        logger.exception("plan failed for task %s", task_id)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            logging.ERROR,
+            "plan_failed",
+            operation="plan",
+            outcome="error",
+            **error_fields(exc),
+        )
         await _update_status(
             update.message,
             progress,
-            "I couldn't check your calendar just now. Please try again shortly.",
+            _failure_text(exc, operation="plan"),
         )
         return
     text, markup = _proposal_message(result, tz)
@@ -917,12 +1052,26 @@ async def reschedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 session_actions.reschedule_session, str(session["id"]), user_id
             ),
         )
-    except Exception:  # noqa: BLE001
-        logger.exception("reschedule failed for task %s", short)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            logging.ERROR,
+            "reschedule_failed",
+            operation="reschedule",
+            outcome="error",
+            **error_fields(exc),
+        )
         await _update_status(
             update.message,
             progress,
-            "I couldn't reschedule just now. Your task is unchanged. Please try again shortly.",
+            _failure_text(exc, operation="reschedule"),
+        )
+        return
+    if result.get("status") == "proposal_failed":
+        await _update_status(
+            update.message,
+            progress,
+            "The previous session was cancelled, but I couldn't check your "
+            "calendar for a new time. Use /plan to request a fresh search.",
         )
         return
     text, markup = _proposal_message(result, tz)
@@ -959,6 +1108,7 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+@_instrument_handler("capture")
 async def capture_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update):
         return
@@ -1116,14 +1266,18 @@ async def capture_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     try:
         result = await asyncio.to_thread(propose_for_task, task_id, user_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("proposal generation failed for task %s", task_id)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            logging.ERROR,
+            "capture_proposal_failed",
+            operation="capture",
+            outcome="error",
+            **error_fields(exc),
+        )
         await _update_status(
             update.message,
             status_message,
-            saved
-            + "\n\nI couldn't check your calendar just now. Your task is still "
-            "saved. Please try again shortly.",
+            saved + "\n\n" + _failure_text(exc, operation="capture"),
             reply_markup=task_keyboard(short),
         )
         return
@@ -1144,6 +1298,7 @@ async def capture_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
 
+@_instrument_handler("attachment")
 async def attachment_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update):
         return
@@ -1178,8 +1333,14 @@ async def attachment_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 file_type=file_type,
                 original_filename=filename,
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("attachment save failed for task %s", target["id"])
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                logging.ERROR,
+                "attachment_save_failed",
+                operation="attachment",
+                outcome="error",
+                **error_fields(exc),
+            )
             await _reply(
                 update.message,
                 "I couldn't save the attachment. Your task is unchanged. "
@@ -1216,8 +1377,14 @@ async def attachment_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             file_type=file_type,
             original_filename=filename,
         )
-    except Exception:  # noqa: BLE001
-        logger.exception("attachment save failed for new task %s", task_id)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            logging.ERROR,
+            "attachment_save_failed",
+            operation="attachment",
+            outcome="error",
+            **error_fields(exc),
+        )
         await _reply(
             update.message,
             f"Saved as a new task: {title}\n\n"
@@ -1268,7 +1435,13 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     filename=item.get("original_filename"),
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("resend attachment failed: %s", exc)
+            log_event(
+                logging.WARNING,
+                "attachment_resend_failed",
+                operation="attachment",
+                outcome="error",
+                **error_fields(exc),
+            )
             await _reply(
                 update.message,
                 "I couldn't resend one attachment. The file may be too large to "
@@ -1348,7 +1521,13 @@ async def _resend_files(context, chat_id: int, short: str) -> str:
                     filename=item.get("original_filename"),
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("resend attachment failed: %s", exc)
+            log_event(
+                logging.WARNING,
+                "attachment_resend_failed",
+                operation="attachment",
+                outcome="error",
+                **error_fields(exc),
+            )
             failed = True
     text = f"Attachments for \"{task[1]}\" ({len(files)}):"
     if failed:
@@ -1359,6 +1538,7 @@ async def _resend_files(context, chat_id: int, short: str) -> str:
     return text
 
 
+@_instrument_handler("callback")
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update):
         return
@@ -1369,17 +1549,67 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_id = update.effective_user.id
     toast = CALLBACK_TOASTS.get(action, "Got it.")
     if not _claim_request(user_id, query.data):
+        log_event(
+            logging.INFO,
+            "callback_duplicate",
+            action=action,
+            outcome="ignored",
+        )
         try:
             await query.answer("I'm already working on this request.")
         except Exception:  # noqa: BLE001
             pass
         return
     try:
+        ack_started = time.perf_counter()
         try:
             await query.answer(toast)
         except Exception as exc:  # noqa: BLE001
-            logger.info("callback answer failed: %s", exc)
-        await _dispatch_callback(update, context, query, action, arg, user_id)
+            log_event(
+                logging.WARNING,
+                "callback_ack",
+                action=action,
+                duration_ms=round(
+                    (time.perf_counter() - ack_started) * 1000, 1
+                ),
+                outcome="error",
+                error_type=type(exc).__name__,
+            )
+        else:
+            log_event(
+                logging.INFO,
+                "callback_ack",
+                action=action,
+                duration_ms=round(
+                    (time.perf_counter() - ack_started) * 1000, 1
+                ),
+                outcome="ok",
+            )
+        action_started = time.perf_counter()
+        try:
+            await _dispatch_callback(update, context, query, action, arg, user_id)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                logging.ERROR,
+                "callback_action",
+                action=action,
+                duration_ms=round(
+                    (time.perf_counter() - action_started) * 1000, 1
+                ),
+                outcome="error",
+                **error_fields(exc),
+            )
+            await _edit(query, _failure_text(exc, operation=action))
+        else:
+            log_event(
+                logging.INFO,
+                "callback_action",
+                action=action,
+                duration_ms=round(
+                    (time.perf_counter() - action_started) * 1000, 1
+                ),
+                outcome="ok",
+            )
     finally:
         _release_request(user_id, query.data)
 
@@ -1413,6 +1643,8 @@ async def _dispatch_callback(update, context, query, action, arg, user_id) -> No
             )
         elif status == "not_found":
             await _edit(query, "I couldn't find that deadline reminder.")
+        elif status == "event_uncertain":
+            await _edit(query, _uncertain_event_text(operation="deadline"))
         else:
             await _edit(
                 query,
@@ -1460,7 +1692,22 @@ async def _dispatch_callback(update, context, query, action, arg, user_id) -> No
             await _edit(query, "I couldn't find that task.")
             return
         await asyncio.to_thread(deadlines.set_reminder_only, task_id, False)
-        result = await asyncio.to_thread(propose_for_task, task_id, user_id)
+        try:
+            result = await asyncio.to_thread(propose_for_task, task_id, user_id)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                logging.ERROR,
+                "prep_proposal_failed",
+                action=action,
+                outcome="error",
+                **error_fields(exc),
+            )
+            await _edit(
+                query,
+                "Preparation is enabled, but I couldn't check your calendar "
+                "for a time. Use /plan to try again.",
+            )
+            return
         body, markup = _proposal_message(result, tz)
         if result.get("status") == "proposed":
             await _edit(query, body, reply_markup=markup)
@@ -1487,7 +1734,25 @@ async def _dispatch_callback(update, context, query, action, arg, user_id) -> No
             await _edit(query, "This proposal has already been approved.")
             return
         if status == "slot_taken":
-            new = await asyncio.to_thread(propose_for_task, result["task_id"], user_id)
+            try:
+                new = await asyncio.to_thread(
+                    propose_for_task, result["task_id"], user_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    logging.ERROR,
+                    "approval_replacement_failed",
+                    action=action,
+                    outcome="error",
+                    **error_fields(exc),
+                )
+                await _edit(
+                    query,
+                    "That time is no longer available. I couldn't check your "
+                    "calendar for another time. Use /plan to request a fresh "
+                    "search.",
+                )
+                return
             body, markup = _proposal_message(new, tz)
             if new.get("status") == "proposed":
                 await _edit(
@@ -1509,12 +1774,14 @@ async def _dispatch_callback(update, context, query, action, arg, user_id) -> No
                 query, "Google Calendar needs to be reconnected. Use /auth."
             )
             return
+        if status == "event_uncertain":
+            await _edit(query, _uncertain_event_text(operation="approve"))
+            return
         if status == "event_failed":
             await _edit(
                 query,
-                "I couldn't create the Google Calendar event: "
-                f"{result.get('error')}\n\n"
-                "Your task is still saved. Try /plan again.",
+                "I couldn't create the Google Calendar event. Your task is "
+                "still saved. Try /plan again.",
             )
             return
         await _edit(
@@ -1542,7 +1809,10 @@ async def _dispatch_callback(update, context, query, action, arg, user_id) -> No
             if proposal is None:
                 return rejected, None
             avoided = [(proposal["proposed_start_at"], proposal["proposed_end_at"])]
-            new = propose_for_task(str(proposal["task_id"]), user_id, avoided)
+            try:
+                new = propose_for_task(str(proposal["task_id"]), user_id, avoided)
+            except Exception as exc:  # noqa: BLE001
+                return rejected, exc
             return rejected, new
 
         _, new = await _with_progress(
@@ -1550,6 +1820,20 @@ async def _dispatch_callback(update, context, query, action, arg, user_id) -> No
             "Request received.\n\nFinding another time...",
             lambda: asyncio.to_thread(find_another),
         )
+        if isinstance(new, Exception):
+            log_event(
+                logging.ERROR,
+                "another_proposal_failed",
+                action=action,
+                outcome="error",
+                **error_fields(new),
+            )
+            await _edit(
+                query,
+                "The previous proposal was declined, but I couldn't check your "
+                "calendar for another time. Use /plan to request a fresh search.",
+            )
+            return
         if new is None:
             await _edit(
                 query,
@@ -1874,13 +2158,16 @@ async def _handle_session_action(query, context, action, arg, user_id, tz) -> No
                 query, "Google Calendar needs to be reconnected. Use /auth."
             )
         elif result["status"] == "calendar_failed":
-            await _edit(
-                query,
-                "I couldn't update the Google Calendar event. Your local session "
-                "time was extended, but the calendar may still show the previous "
-                "end time.\n\nPlease reconnect or retry before relying on the "
-                "updated calendar time.",
-            )
+            if result.get("uncertain"):
+                await _edit(query, _uncertain_event_text(operation="extend"))
+            else:
+                await _edit(
+                    query,
+                    "I couldn't update the Google Calendar event. Your local "
+                    "session time was extended, but the calendar may still show "
+                    "the previous end time.\n\nPlease reconnect or retry before "
+                    "relying on the updated calendar time.",
+                )
         else:
             await _edit(
                 query,
@@ -1889,7 +2176,35 @@ async def _handle_session_action(query, context, action, arg, user_id, tz) -> No
             )
         return
     if action == "reschedule":
-        result = await asyncio.to_thread(session_actions.reschedule_session, arg, user_id)
+        result = await asyncio.to_thread(
+            session_actions.reschedule_session, arg, user_id
+        )
+        status = result.get("status")
+        if status == "calendar_failed":
+            if result.get("uncertain"):
+                await _edit(query, _uncertain_event_text(operation="reschedule"))
+            else:
+                await _edit(
+                    query,
+                    "I couldn't remove the previous Google Calendar event. Your "
+                    "existing session is still scheduled. Please try again.",
+                )
+            return
+        if status == "needs_auth":
+            await _edit(
+                query, "Google Calendar needs to be reconnected. Use /auth."
+            )
+            return
+        if status in ("not_found", "already_closed"):
+            await _edit(query, _proposal_message(result, tz)[0])
+            return
+        if status == "proposal_failed":
+            await _edit(
+                query,
+                "The previous session was cancelled, but I couldn't check your "
+                "calendar for a new time. Use /plan to request a fresh search.",
+            )
+            return
         body, markup = _proposal_message(result, tz)
         await _edit(query, "The previous session has been cancelled.")
         if markup is not None:
@@ -1925,9 +2240,15 @@ async def _edit(query, text: str, reply_markup=None) -> None:
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
     except Exception as exc:  # noqa: BLE001
-        logger.info("edit message failed: %s", exc)
+        log_event(
+            logging.WARNING,
+            "telegram_edit_failed",
+            error_type=type(exc).__name__,
+            outcome="error",
+        )
 
 
+@_instrument_handler("command")
 async def command_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update):
         return
@@ -1939,13 +2260,18 @@ async def command_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     name = parts[0][1:].split("@")[0].lower()
     handler = COMMANDS.get(name)
     if handler is None:
-        logger.info("unknown command %r from %s", name, update.effective_user.id)
+        log_event(
+            logging.INFO,
+            "telegram_unknown_command",
+            action=name,
+            outcome="ignored",
+        )
         await _reply(
             message,
             "I don't recognize that command. Use /help to see what I can do.",
         )
         return
-    logger.info("command %r from %s", name, update.effective_user.id)
+    log_event(logging.INFO, "telegram_command", action=name, outcome="ok")
     context.args = parts[1:]
     await handler(update, context)
 
@@ -1972,12 +2298,35 @@ COMMANDS = {
 }
 
 
+async def error_handler(update, context) -> None:
+    exc = context.error or RuntimeError("unknown telegram error")
+    log_event(
+        logging.ERROR,
+        "telegram_unhandled_error",
+        outcome="error",
+        **error_fields(exc),
+    )
+    if update is None:
+        return
+    if getattr(update, "callback_query", None) is not None:
+        await _edit(
+            update.callback_query,
+            _failure_text(exc, operation="callback"),
+        )
+    elif getattr(update, "effective_message", None) is not None:
+        await _reply(
+            update.effective_message,
+            _failure_text(exc, operation="update"),
+        )
+
+
 def build_application(token: str) -> Application:
     app = Application.builder().token(token).build()
     app.add_handler(MessageHandler(filters.COMMAND, command_router))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, attachment_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, capture_message))
+    app.add_error_handler(error_handler)
     return app
 
 
@@ -1989,11 +2338,7 @@ def main() -> None:
         raise SystemExit(
             "TELEGRAM_ALLOWED_USER_IDS is empty Ã¢â‚¬â€ refusing to start (fail closed)"
         )
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    configure_logging()
     build_application(settings.telegram_bot_token).run_polling(
         allowed_updates=Update.ALL_TYPES
     )

@@ -1,7 +1,12 @@
-﻿from datetime import date, datetime, timedelta
+﻿import logging
+import time
+from datetime import date, datetime, timedelta
 
 import httpx
 from google.oauth2.credentials import Credentials
+
+from app.errors import error_fields
+from app.observability import log_event
 
 CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
 
@@ -18,12 +23,56 @@ def _headers(creds: Credentials) -> dict:
     return {"Authorization": f"Bearer {creds.token}"}
 
 
+def _request(operation: str, method: str, url: str, **kwargs) -> httpx.Response:
+    started = time.perf_counter()
+    try:
+        response = getattr(httpx, method)(url, **kwargs)
+    except Exception as exc:
+        log_event(
+            logging.WARNING,
+            "google_calendar_call",
+            operation=operation,
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            outcome="error",
+            **error_fields(exc),
+        )
+        raise
+    log_event(
+        logging.INFO,
+        "google_calendar_call",
+        operation=operation,
+        duration_ms=round((time.perf_counter() - started) * 1000, 1),
+        outcome="ok",
+        status_code=response.status_code,
+    )
+    return response
+
+
 def _check(resp: httpx.Response, what: str) -> None:
     if resp.status_code in (401, 403):
+        log_event(
+            logging.WARNING,
+            "google_calendar_auth_required",
+            operation=what,
+            status_code=resp.status_code,
+            outcome="error",
+            error_code="auth_required",
+        )
         raise GoogleAuthRequired(
             f"{what}: HTTP {resp.status_code} \u2014 Google login needs to be repeated (/auth)"
         )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        log_event(
+            logging.WARNING,
+            "google_calendar_http_error",
+            operation=what,
+            status_code=resp.status_code,
+            outcome="error",
+            **error_fields(exc),
+        )
+        raise
 
 
 def get_busy_intervals(
@@ -37,7 +86,9 @@ def get_busy_intervals(
         "timeMax": time_max.isoformat(),
         "items": [{"id": calendar_id}],
     }
-    resp = httpx.post(
+    resp = _request(
+        "freeBusy",
+        "post",
         f"{CALENDAR_BASE}/freeBusy",
         json=payload,
         headers=_headers(creds),
@@ -76,7 +127,9 @@ def create_event(
     }
     if event_id:
         body["id"] = event_id
-    resp = httpx.post(
+    resp = _request(
+        "createEvent",
+        "post",
         f"{CALENDAR_BASE}/calendars/{calendar_id}/events",
         json=body,
         headers=_headers(creds),
@@ -91,7 +144,9 @@ def create_event(
 def get_event(
     creds: Credentials, calendar_id: str, event_id: str
 ) -> dict | None:
-    resp = httpx.get(
+    resp = _request(
+        "getEvent",
+        "get",
         f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{event_id}",
         headers=_headers(creds),
         timeout=30,
@@ -111,7 +166,9 @@ def update_event_time(
     end: datetime,
     timezone: str = "Asia/Jakarta",
 ) -> bool:
-    resp = httpx.patch(
+    resp = _request(
+        "updateEventTime",
+        "patch",
         f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{event_id}",
         json={
             "start": {"dateTime": start.isoformat(), "timeZone": timezone},
@@ -127,7 +184,9 @@ def update_event_time(
 
 
 def delete_event(creds: Credentials, calendar_id: str, event_id: str) -> bool:
-    resp = httpx.delete(
+    resp = _request(
+        "deleteEvent",
+        "delete",
         f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{event_id}",
         headers=_headers(creds),
         timeout=30,
@@ -156,7 +215,9 @@ def create_all_day_event(
     }
     if event_id:
         body["id"] = event_id
-    resp = httpx.post(
+    resp = _request(
+        "createAllDayEvent",
+        "post",
         f"{CALENDAR_BASE}/calendars/{calendar_id}/events",
         json=body,
         headers=_headers(creds),
@@ -175,7 +236,9 @@ def update_event_date(
     *,
     event_date: date,
 ) -> bool:
-    resp = httpx.patch(
+    resp = _request(
+        "updateEventDate",
+        "patch",
         f"{CALENDAR_BASE}/calendars/{calendar_id}/events/{event_id}",
         json={
             "start": {"date": event_date.isoformat()},

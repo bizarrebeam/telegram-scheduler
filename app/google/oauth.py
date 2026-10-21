@@ -1,4 +1,5 @@
 import json
+import logging
 import secrets
 import time
 
@@ -7,7 +8,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 
 from app.config import get_settings
+from app.errors import error_fields
 from app.google.token_store import load_credentials_json, save_credentials_json
+from app.observability import log_event
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
@@ -78,7 +81,24 @@ def load_user_credentials(telegram_user_id: int) -> Credentials | None:
         return None
     creds = Credentials.from_authorized_user_info(json.loads(raw))
     if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        started = time.perf_counter()
+        try:
+            creds.refresh(Request())
+        except Exception as exc:
+            log_event(
+                logging.WARNING,
+                "google_token_refresh",
+                duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                outcome="error",
+                **error_fields(exc),
+            )
+            raise
+        log_event(
+            logging.INFO,
+            "google_token_refresh",
+            duration_ms=round((time.perf_counter() - started) * 1000, 1),
+            outcome="ok",
+        )
         save_credentials_json(telegram_user_id, creds.to_json(), " ".join(SCOPES))
     return creds
 

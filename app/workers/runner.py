@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from telegram.error import RetryAfter, TimedOut
 
 from app.config import get_settings
+from app.errors import error_fields
+from app.observability import log_context, log_event, timed_event
 from app.services import deadlines, jobs, reminders, sessions as sessions_service
 from app.services import proposals, settings as settings_service
 from app.telegram_bot.ui import (
@@ -13,8 +15,6 @@ from app.telegram_bot.ui import (
     missed_keyboard,
     session_keyboard,
 )
-
-logger = logging.getLogger(__name__)
 
 TICK_SECONDS = 20
 GRACE_MINUTES = 10
@@ -162,7 +162,12 @@ async def _handle_deadlines(bot) -> None:
             "/deadline <task_id> <date> to change the deadline.",
         )
         await asyncio.to_thread(deadlines.mark_overdue_notified, [task["task_id"]])
-        logger.info("notified overdue deadline for %s to %s", task["task_id"], user_ids)
+        log_event(
+            logging.INFO,
+            "deadline_overdue_notified",
+            count=len(user_ids),
+            outcome="ok",
+        )
 
 
 async def _handle_sync_calendar(bot) -> None:
@@ -198,7 +203,12 @@ async def _handle(bot, job: dict) -> None:
     elif kind == "sync_calendar":
         await _handle_sync_calendar(bot)
     else:
-        logger.warning("unknown job kind %s", kind)
+        log_event(
+            logging.WARNING,
+            "worker_unknown_job",
+            job_kind=kind,
+            outcome="ignored",
+        )
 
 
 def _schedule_daily_sync() -> None:
@@ -213,22 +223,63 @@ def _schedule_daily_sync() -> None:
 
 async def run_worker(tg_app) -> None:
     bot = tg_app.bot
+    tick_number = 0
     while True:
+        tick_number += 1
+        tick_id = f"worker-tick-{tick_number}"
         try:
-            await asyncio.to_thread(jobs.reset_stale_running)
-            await asyncio.to_thread(jobs.reap_expired_proposals)
-            await asyncio.to_thread(_schedule_daily_sync)
-            claimed = await asyncio.to_thread(jobs.claim_due, 10)
-            for job in claimed:
-                try:
-                    await _handle(bot, job)
-                    await asyncio.to_thread(jobs.mark_done, job["id"])
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("job %s (%s) failed: %s", job["id"], job["kind"], exc)
-                    await asyncio.to_thread(jobs.mark_failed, job["id"], str(exc))
+            with log_context("worker", request_id=tick_id, tick_id=tick_id):
+                with timed_event("worker_tick", tick_id=tick_id):
+                    await asyncio.to_thread(jobs.reset_stale_running)
+                    await asyncio.to_thread(jobs.reap_expired_proposals)
+                    await asyncio.to_thread(_schedule_daily_sync)
+                    claimed = await asyncio.to_thread(jobs.claim_due, 10)
+                    log_event(
+                        logging.INFO,
+                        "worker_claimed_jobs",
+                        count=len(claimed),
+                        outcome="ok",
+                    )
+                    for job in claimed:
+                        job_id = str(job["id"])
+                        job_kind = job["kind"]
+                        with log_context(
+                            "worker_job",
+                            request_id=f"job-{job_id}",
+                            job_id=job_id,
+                            job_kind=job_kind,
+                        ):
+                            try:
+                                with timed_event(
+                                    "worker_job",
+                                    job_id=job_id,
+                                    job_kind=job_kind,
+                                ):
+                                    await _handle(bot, job)
+                                    await asyncio.to_thread(
+                                        jobs.mark_done, job["id"]
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                log_event(
+                                    logging.WARNING,
+                                    "worker_job_failed",
+                                    job_id=job_id,
+                                    job_kind=job_kind,
+                                    outcome="error",
+                                    **error_fields(exc),
+                                )
+                                await asyncio.to_thread(
+                                    jobs.mark_failed, job["id"], str(exc)
+                                )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
-            logger.exception("worker tick failed")
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                logging.ERROR,
+                "worker_tick_failed",
+                tick_id=tick_id,
+                outcome="error",
+                **error_fields(exc),
+            )
         await asyncio.sleep(TICK_SECONDS)
 

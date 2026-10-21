@@ -6,11 +6,12 @@ from fastapi import FastAPI
 from telegram import Update
 
 from app.config import get_settings
+from app.observability import configure_logging, log_event
 from app.telegram_bot.bot import build_application
 from app.web.oauth_routes import router
 from app.workers.runner import run_worker
 
-logger = logging.getLogger(__name__)
+configure_logging()
 
 
 @asynccontextmanager
@@ -24,9 +25,18 @@ async def lifespan(app: FastAPI):
         await tg_app.start()
         await tg_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         worker_task = asyncio.create_task(run_worker(tg_app))
-        logger.info("telegram bot polling started")
+        log_event(
+            logging.INFO,
+            "telegram_polling_started",
+            outcome="ok",
+        )
     else:
-        logger.warning("telegram bot not started: token or allowlist missing")
+        log_event(
+            logging.WARNING,
+            "telegram_polling_skipped",
+            outcome="error",
+            error_code="missing_configuration",
+        )
     app.state.tg_app = tg_app
     try:
         yield
