@@ -46,8 +46,8 @@ def describe_priority(deadline_at: datetime | None, now: datetime) -> str:
 def availability_from_settings(settings_row: dict) -> Availability:
     return Availability(
         timezone=settings_row.get("timezone") or "Asia/Jakarta",
-        weekday_start=time(8, 0),
-        weekday_end=time(21, 0),
+        weekday_start=time(20, 0),
+        weekday_end=time(23, 0),
         weekend_enabled=True,
         weekend_start=time(8, 0),
         weekend_end=time(21, 0),

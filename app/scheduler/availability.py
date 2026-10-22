@@ -6,8 +6,8 @@ from zoneinfo import ZoneInfo
 @dataclass(frozen=True)
 class Availability:
     timezone: str = "Asia/Jakarta"
-    weekday_start: time = time(8, 0)
-    weekday_end: time = time(21, 0)
+    weekday_start: time = time(20, 0)
+    weekday_end: time = time(23, 0)
     weekend_enabled: bool = True
     weekend_start: time | None = time(8, 0)
     weekend_end: time | None = time(21, 0)
